@@ -1,0 +1,595 @@
+---
+title: "Final Bird Project"
+author: "PMM"
+format: pdf
+editor: visual
+---
+
+### Trying to do gull things
+
+```{r}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(adehabitatLT)
+library(sf)           
+library(data.table)   
+library(tictoc)
+library(ggplot2)
+# ==============================================================================
+# 1. DATA EXTRACTION & FILTERING
+# ==============================================================================
+raw_gull <- read_csv("FTZ_ Foraging site fidelity and spatial segregation in great black-backed gulls (data from Borrmann et al. 2019).csv") %>%
+  mutate(timestamp = ymd_hms(timestamp), date = as_date(timestamp)) %>%
+  group_by(`individual-local-identifier`) %>%
+  filter(timestamp >= min(timestamp, na.rm = TRUE) + days(2)) %>%
+  ungroup() %>%
+  mutate(breeding_stage = case_when(
+    format(timestamp, "%m-%d") <= "05-31" ~ "Incubation",
+    format(timestamp, "%m-%d") <= "07-15" ~ "Chick-Rearing",
+    TRUE ~ "Post-Breeding"
+  )) %>%
+  filter(breeding_stage != "Post-Breeding") %>%
+  group_by(`individual-local-identifier`) %>%
+  filter("Chick-Rearing" %in% breeding_stage) %>%
+  ungroup()
+
+# ==============================================================================
+# 2. SPATIAL PROJECTION (Degrees -> Meters)
+# ==============================================================================
+# Convert raw lat/long into a spatial object, then project to UTM Zone 32N (Meters)
+# This is mandatory for recurse to accurately calculate a 500m radius
+gull_sf <- st_as_sf(raw_gull, coords = c("location-long", "location-lat"), crs = 4326) %>%
+  st_transform(crs = 32632) # EPSG:32632 is UTM 32N
+
+# Extract the new metric coordinates back into the dataframe
+coords_utm <- st_coordinates(gull_sf)
+raw_gull$x_utm <- coords_utm[,1]
+raw_gull$y_utm <- coords_utm[,2]
+
+# ==============================================================================
+# 3. TRAJECTORY INTERPOLATION
+# ==============================================================================
+# Use the new metric coordinates for the trajectory
+xy_data <- raw_gull[, c("x_utm", "y_utm")]
+date_vec <- raw_gull$timestamp
+id_vec   <- raw_gull$`individual-local-identifier`
+
+# Store original metadata 
+metadata_to_keep <- raw_gull %>%
+  select(`individual-local-identifier`, timestamp, `ground-speed`, breeding_stage)
+
+# Create and interpolate trajectory (1 point every 300 seconds / 5 mins)
+gull_traj <- as.ltraj(xy = xy_data, date = date_vec, id = id_vec)
+gull_interp <- redisltraj(gull_traj, u = 300, type = "time")
+
+# Convert back to dataframe
+raw_gull_interpolated <- ld(gull_interp) %>%
+  rename(
+    `individual-local-identifier` = id, 
+    timestamp = date, 
+    x_utm = x, 
+    y_utm = y
+  ) %>%
+  mutate(date = as_date(timestamp))
+
+# ==============================================================================
+# 4. METADATA REJOIN (Rolling Join)
+# ==============================================================================
+# Convert to data.table for the nearest-neighbor join
+setDT(raw_gull_interpolated)
+setDT(metadata_to_keep)
+
+# Set the exact columns to join on
+setkey(raw_gull_interpolated, `individual-local-identifier`, timestamp)
+setkey(metadata_to_keep, `individual-local-identifier`, timestamp)
+
+# Perform the rolling join: grabs the metadata from the closest actual GPS ping
+raw_gull_final <- metadata_to_keep[raw_gull_interpolated, roll = "nearest"]
+
+# Convert back to a standard tibble/dataframe for the rest of your project
+raw_gull_final <- as_tibble(raw_gull_final)
+
+```
+
+###Intertidal mudflats detection
+
+```{r}
+
+library(osmdata)
+library(sf)
+library(dplyr)
+tic("tidal analysis")
+# ==============================================================================
+# 2A. MUDFLAT POLYGON EXTRACTION (VIA OSM)
+# ==============================================================================
+# 1. Define bounding box around the Föhr/Amrum Wadden Sea region
+# (xmin, ymin, xmax, ymax)
+study_area <- c(7.8, 54.2, 9.0, 54.9) 
+#study_area <- c(8.2, 54.4, 8.8, 55.0) 
+
+message("Downloading Wadden Sea tidal flats from OSM (Please wait 1-2 minutes)...")
+
+# We only use the official 'tidalflat' tag to avoid the osmdata parsing bug
+osm_tidal <- opq(bbox = study_area, timeout = 300) %>%
+  add_osm_feature(key = 'wetland', value = 'tidalflat') %>%
+  osmdata_sf()
+
+# Extract and combine Polygons and Multipolygons
+mudflat_poly <- bind_rows(
+  osm_tidal$osm_polygons,
+  osm_tidal$osm_multipolygons
+) %>%
+  # Filter out empty geometries
+  filter(!st_is_empty(geometry)) %>%
+  # Project to UTM Zone 32N (Meters) to match your GPS data
+  st_transform(crs = 32632)
+
+# ==============================================================================
+# 2B. POINT-IN-POLYGON CALCULATION
+# ==============================================================================
+# Convert your interpolated GPS tracks into spatial points
+gull_sf <- st_as_sf(raw_gull_final, coords = c("x_utm", "y_utm"), crs = 32632)
+
+# Check which points fall inside the mudflat boundaries!
+# This calculates the intersection and assigns TRUE/FALSE
+message("Running spatial point-in-polygon math...")
+raw_gull_final$in_mudflat <- lengths(st_intersects(gull_sf, mudflat_poly)) > 0
+
+#Check how many points landed in the mud!
+table(raw_gull_final$in_mudflat)
+
+# Plot the first 1000 GPS fixes on top of the mudflats
+# Use ggplot to verify your spatial data
+ggplot() +
+  geom_sf(data = mudflat_poly, fill = "saddlebrown", color = NA) +
+  theme_minimal() +
+  labs(title = "Verified OSM Tidal Flats: Wadden Sea")
+```
+
+###recurse analysis for foraging ID
+
+```{r}
+library(recurse)
+library(dplyr)
+library(lubridate)
+library(tictoc)
+
+# ==============================================================================
+# 2C. RECURSE ANALYSIS (Patch Identification)
+# ==============================================================================
+
+# 1. Run recursion analysis per bird to save memory
+bird_ids <- unique(raw_gull_final$id)
+gull_revisits_list <- list()
+
+tic("revision recur")
+for(bird in bird_ids) {
+  message("Processing bird: ", bird)
+  df_bird <- raw_gull_final %>%
+    filter(id == bird) %>%
+    # Thinning to 15 mins (every 3rd point) to save memory
+    filter(row_number() %% 3 == 1) %>%
+    select(x = x_utm, y = y_utm, t = timestamp, id = id) %>%
+    as.data.frame()
+  
+  # Run recursion
+  res <- getRecursions(df_bird, radius = 500)
+  
+  # SAFETY CHECK: Only store if revisits were found
+  if(nrow(res$revisitStats) > 0) {
+    gull_revisits_list[[bird]] <- res$revisitStats
+  } else {
+    message("No revisits found for: ", bird)
+  }
+}
+toc()
+
+gull_revisits_list <- gull_revisits_list[sapply(gull_revisits_list, nrow) > 0]
+
+# 2. Use bind_rows correctly
+# The .id argument will use the names of the list (your bird IDs) 
+# to create the ID column automatically
+all_revisits <- bind_rows(gull_revisits_list, `individual-local-identifier` = "individual-local-identifier") %>%
+  select(`individual-local-identifier`, timestamp = entranceTime, residence_time_hrs = timeInside) %>%
+  setDT()
+
+# 3. Join back to your GPS data
+# Since you have now standardized the ID column to 'id' in both tables:
+setDT(raw_gull_final)
+setnames(raw_gull_final, "individual-local-identifier", "id", skip_absent = TRUE)
+
+setkey(raw_gull_final, id, timestamp)
+setkey(all_revisits, id, timestamp)
+
+# Redefine 'all_revisits'
+all_revisits <- bind_rows(gull_revisits_list, .id = "id") %>%
+  rename(start = entranceTime, 
+         end = exitTime, 
+         residence_time_hrs = timeInside) %>%
+  setDT()
+
+
+# non-equi join
+raw_gull_final <- all_revisits[raw_gull_final, 
+                               on = .(id, start <= timestamp, end >= timestamp), 
+                               .(id, timestamp, x_utm, y_utm, 
+                                 residence_time_hrs = residence_time_hrs)]
+
+# Cleanup
+raw_gull_final[is.na(residence_time_hrs), residence_time_hrs := 0]
+
+
+
+
+# ==============================================================================
+# 3A. DYNAMIC NEST LOCATION CALCULATION (The Geography Fix)
+# ==============================================================================
+# Find each bird's specific nest by calculating the median location 
+# where they spend their nights during the Incubation phase.
+nest_coords <- raw_gull_final %>%
+  filter(breeding_stage == "Incubation", hour(timestamp) >= 22 | hour(timestamp) <= 3) %>%
+  group_by(`individual-local-identifier`) %>%
+  summarise(
+    Nest_utm_x = median(x_utm, na.rm = TRUE),
+    Nest_utm_y = median(y_utm, na.rm = TRUE),
+    .groups = "drop"
+  )
+# Remove all the duplicate nest columns
+raw_gull_final <- raw_gull_final %>%
+  # Select only the columns you actually need
+  select(
+    `individual-local-identifier`, timestamp, `ground-speed`, breeding_stage, 
+    x_utm, y_utm, residence_time_hrs, in_mudflat
+  ) %>%
+  # Re-join the clean nest coordinates just once
+  left_join(nest_coords, by = "individual-local-identifier")
+
+
+# ==============================================================================
+# 3B. SEGMENTATION AND CLASSIFICATION
+# ==============================================================================
+raw_gull_final <- raw_gull_final %>%
+  # 1. Distance Calculation (Now measuring from their UNIQUE nests!)
+  mutate(
+    dist_colony_m = sqrt((x_utm - Nest_utm_x)^2 + (y_utm - Nest_utm_y)^2),
+    is_far = dist_colony_m > 500  
+  ) %>%
+  
+  # 2. Sort strictly by time to ensure chronological order
+  arrange(`individual-local-identifier`, timestamp) %>%
+  
+  # 3. Create Trip Breaks
+  group_by(`individual-local-identifier`) %>%
+  mutate(
+    trip_break = (is_far != lag(is_far, default = FALSE)),
+    segment_id = cumsum(trip_break)
+  ) %>%
+  
+  # 4. Group by Segment to calculate Trip-Level Metrics
+  group_by(`individual-local-identifier`, segment_id) %>%
+  mutate(
+    trip_dur_mins = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    trip_n_fixes = n(),
+    max_dist_km = max(dist_colony_m, na.rm = TRUE) / 1000,
+    
+    max_residence_hrs = max(residence_time_hrs, na.rm = TRUE),
+    has_foraging_patch = max_residence_hrs >= 0.5, 
+    
+    used_mudflat = any(in_mudflat == TRUE & residence_time_hrs >= 0.5),
+    
+    valid_trip = (is_far == TRUE) & (trip_n_fixes >= 3) & (trip_dur_mins > 30) & (trip_dur_mins < 1440),
+    
+    # 5. Final Behavioral Classification
+    trip_class = case_when(
+      !valid_trip ~ "Colony/Rest/Transit",
+      valid_trip & has_foraging_patch & used_mudflat ~ "Mudflat Foraging Trip",
+      valid_trip & has_foraging_patch & !used_mudflat ~ "Other Foraging Trip (Pelagic/Inland)",
+      valid_trip & !has_foraging_patch ~ "Search/Commute (No Patch Found)"
+    )
+  ) %>%
+  ungroup()
+
+# ==============================================================================
+# 3C. EXTRACT ANALYTICAL DATASET
+# ==============================================================================
+foraging_data <- raw_gull_final %>%
+  filter(trip_class %in% c("Mudflat Foraging Trip", "Other Foraging Trip (Pelagic/Inland)"))
+
+# Check your recovered birds!
+print(unique(foraging_data$`individual-local-identifier`))
+```
+
+###Tide analysis
+
+```{r}
+library(jsonlite)
+library(dplyr)
+library(lubridate)
+
+# ==============================================================================
+# 4A. EXTRACT OFFICIAL DATUMS
+# ==============================================================================
+# Read the official Hörnum tidal data
+hoernum_data <- fromJSON("hrnum-9570050-deu-wsv.json")
+
+# Extract the limits
+MHW <- hoernum_data$datums$MHW  
+MLW <- hoernum_data$datums$MLW  
+
+# ==============================================================================
+# 4B. CALCULATE WATER LEVEL & CLASSIFY
+# ==============================================================================
+foraging_data <- foraging_data %>%
+  mutate(
+    # 1. Calculate the phase of the M2 lunar cycle (Period = 44712 seconds)
+    tide_phase = (as.numeric(timestamp) %% 44712) / 44712,
+    
+    # 2. Simulate the water height (m) oscillating between official datums
+    water_level_m = MLW + (MHW - MLW) * (0.5 * (1 + sin(2 * pi * tide_phase))),
+    
+    # 3. Classify into biological states (20cm buffer around extreme highs/lows)
+    tide_state = case_when(
+      water_level_m >= (MHW - 0.20) ~ "High Tide",
+      water_level_m <= (MLW + 0.20) ~ "Low Tide",
+      TRUE ~ "Transition"
+    ),
+    
+    # Factorize for orderly plotting and modeling
+    tide_state = factor(tide_state, levels = c("Low Tide", "Transition", "High Tide"))
+  )
+
+# ==============================================================================
+# 4C. SUMMARIZE TRIP METRICS FOR GLMM
+# ==============================================================================
+# Distill the hundreds of pings into a single binary metric per trip
+trip_tide_summary <- foraging_data %>%
+  group_by(`individual-local-identifier`, breeding_stage, segment_id, trip_class) %>%
+  summarise(
+    total_fixes = n(),
+    prop_high_tide = sum(tide_state == "High Tide") / total_fixes,
+    
+    # GLMM Response Variable: Did this trip occur primarily during High Tide?
+    is_high_tide_trip = ifelse(prop_high_tide > 0.5, 1, 0),
+    .groups = "drop"
+  )
+
+# Preview the final, model-ready dataset
+head(trip_tide_summary)
+```
+
+###Calculating metrics
+
+```{r}
+library(dplyr)
+
+# ==============================================================================
+# 1. CALCULATE METRICS PER TRIP
+# ==============================================================================
+# We calculate max range, mudflat foraging time, and determine the dominant 
+# tide state for every single valid trip.
+
+trip_metrics <- foraging_data %>%
+  group_by(`individual-local-identifier`, breeding_stage, segment_id, trip_class) %>%
+  summarise(
+    # 1. Maximal Distance (converted from meters to km)
+    max_range_km = max(dist_colony_m, na.rm = TRUE) / 1000,
+    
+    # 2. Foraging Time in Mudflats (Mins)
+    # Count fixes where the bird is in the mudflat polygon AND resident > 30 mins.
+    # Multiply by 5 because our interpolated data is strictly 1 fix = 5 mins.
+    mudflat_forage_mins = sum(in_mudflat == TRUE & residence_time_hrs >= 0.5, na.rm = TRUE) * 5,
+    
+    # 3. Dominant Tide State
+    # Finds which tide state had the highest number of GPS fixes during this specific trip
+    primary_tide_state = names(which.max(table(tide_state))),
+    
+    .groups = "drop"
+  ) %>%
+  # Ensure the tide states stay in logical order for plotting/modeling
+  mutate(primary_tide_state = factor(primary_tide_state, levels = c("Low Tide", "Transition", "High Tide")))
+
+# ==============================================================================
+# 2. AGGREGATE TO INDIVIDUAL AVERAGES BY TIDE & BREEDING STAGE
+# ==============================================================================
+# Now we summarize the trip data to see how the "Parental Tax" and the "Tidal Cycle" 
+# interact to shape the birds' overall effort.
+
+indiv_tide_summary <- trip_metrics %>%
+  group_by(`individual-local-identifier`, breeding_stage, primary_tide_state) %>%
+  summarise(
+    # A. Return Trips: How many trips were initiated under this tide state?
+    total_trips = n(),
+    
+    # B. Mean Distance: How far do they fly under this tide state?
+    mean_max_range_km = mean(max_range_km, na.rm = TRUE),
+    
+    # C. Foraging Time: How much time is actually spent eating in the mud?
+    mean_mudflat_time_mins = mean(mudflat_forage_mins, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+# View the final analytical dataset
+head(indiv_tide_summary)
+
+```
+
+
+###Statistical Analysis
+
+```{r}
+library(dplyr)
+library(lme4)
+library(lmerTest)
+
+# Create a Pair ID column
+# Assign 03 and 04 to the same group, others to their own unique ID
+indiv_tide_summary <- indiv_tide_summary %>%
+  mutate(
+    pair_id = case_when(
+      `individual-local-identifier` %in% c("GBBG-Foehr-2016-03", "GBBG-Foehr-2016-04") ~ "Pair_1",
+      TRUE ~ paste0("Single_", `individual-local-identifier`)
+    )
+  )
+
+# ==============================================================================
+# 1. DATA PREPARATION & EXPOSURE TIME
+# ==============================================================================
+# Calculate exactly how many days each bird was tracked per breeding stage
+tracking_effort <- raw_gull_final %>%
+  group_by(`individual-local-identifier`, breeding_stage) %>%
+  summarise(
+    tracking_days = as.numeric(difftime(max(timestamp), min(timestamp), units = "days")),
+    .groups = "drop"
+  )
+
+# Join tracking days to the summary dataset and set factor baselines
+# Skip the join since it's already done! Just run the math and factor leveling:
+# This keeps your original data and adds the tracking_days column to it
+indiv_tide_summary <- indiv_tide_summary %>%
+  left_join(tracking_effort, by = c("individual-local-identifier", "breeding_stage"))
+
+indiv_tide_summary <- indiv_tide_summary %>%
+  mutate(
+    # Calculate raw rate for descriptive plotting later
+    trips_per_day = total_trips / tracking_days,
+    
+    # Set statistical baselines to compare against Incubation / Low Tide
+    breeding_stage = relevel(factor(breeding_stage), ref = "Incubation"),
+    primary_tide_state = relevel(factor(primary_tide_state), ref = "Low Tide")
+  )
+
+# Verify it worked!
+head(indiv_tide_summary$trips_per_day)
+
+# ==============================================================================
+# 2. STATISTICAL MODELING (GLMMs)
+# ==============================================================================
+
+# A. RETURN TRIP RATE (Poisson GLMM with Offset)
+# Tests if chick-rearing increases trip frequency when accounting for days tracked
+# Update your GLMMs to include the Pair ID
+# This nests the individual within the pair, correctly accounting for 
+# the fact that Bird 03 and Bird 04 share a nest and coordinate their trips.
+
+trips_rate_model <- glmer(total_trips ~ breeding_stage * primary_tide_state + 
+                            offset(log(tracking_days)) + 
+                            (1 | pair_id / `individual-local-identifier`), 
+                          data = indiv_tide_summary, 
+                          family = poisson)
+
+range_model <- glmer(mean_max_range_km ~ breeding_stage * primary_tide_state + 
+                        (1 | pair_id / `individual-local-identifier`), 
+                      data = indiv_tide_summary, 
+                      family = Gamma(link = "log"))
+
+time_model <- glmer((mean_mudflat_time_mins + 0.1) ~ breeding_stage * primary_tide_state + 
+                      (1 | pair_id / `individual-local-identifier`), 
+                    data = indiv_tide_summary, 
+                    family = Gamma(link = "log"))
+
+# 3. OUTPUT SUMMARIES
+# ==============================================================================
+cat("\n--- MODEL 1: RETURN TRIP RATE ---\n")
+summary(trips_rate_model)
+
+cat("\n--- MODEL 2: MAXIMAL DISTANCE ---\n")
+summary(range_model)
+
+cat("\n--- MODEL 3: FORAGING TIME EFFICIENCY ---\n")
+summary(time_model)
+``` 
+
+
+### Data Visualizations matching the Mixed Models
+
+```{r}
+library(emmeans)
+library(ggplot2)
+library(patchwork)
+
+# ==============================================================================
+# 1. GENERATE ESTIMATED MARGINAL MEANS (Model Predictions)
+# ==============================================================================
+
+# A. Trip Rate Predictions (Poisson model requires offset)
+em_trips_daily <- as.data.frame(emmeans(trips_rate_model, 
+                                        ~ breeding_stage * primary_tide_state, 
+                                        offset = 0, # Standardizes to 1 day
+                                        type = "response"))
+
+colnames(em_trips_daily)[colnames(em_trips_daily) %in% c("rate", "response")] <- "daily_rate"
+colnames(em_trips_daily)[colnames(em_trips_daily) %in% c("asymp.LCL", "lower.CL")] <- "lower"
+colnames(em_trips_daily)[colnames(em_trips_daily) %in% c("asymp.UCL", "upper.CL")] <- "upper"
+
+# B. Foraging Time Predictions (Gamma model)
+em_time <- as.data.frame(emmeans(time_model, 
+                                 ~ breeding_stage * primary_tide_state, 
+                                 type = "response"))
+
+colnames(em_time)[colnames(em_time) %in% c("rate", "response")] <- "response"
+colnames(em_time)[colnames(em_time) %in% c("asymp.LCL", "lower.CL")] <- "lower"
+colnames(em_time)[colnames(em_time) %in% c("asymp.UCL", "upper.CL")] <- "upper"
+
+# C. Maximum Distance Predictions (Gamma model) - THIS IS NEW!
+em_range <- as.data.frame(emmeans(range_model, 
+                                  ~ breeding_stage * primary_tide_state, 
+                                  type = "response"))
+
+colnames(em_range)[colnames(em_range) %in% c("rate", "response")] <- "response"
+colnames(em_range)[colnames(em_range) %in% c("asymp.LCL", "lower.CL")] <- "lower"
+colnames(em_range)[colnames(em_range) %in% c("asymp.UCL", "upper.CL")] <- "upper"
+
+# ==============================================================================
+# 3. BUILD THE PLOTS (Optimized)
+# ==============================================================================
+# Custom color palette
+col_pal <- c("Incubation" = "#4A90E2", "Chick-Rearing" = "#E67E22")
+
+# We define the legend title once as a variable for consistency
+leg_title <- "Breeding Stage"
+
+p1 <- ggplot(em_trips_daily, aes(x = primary_tide_state, y = daily_rate, 
+                                 color = breeding_stage, group = breeding_stage)) +
+  geom_jitter(data = plot_data, aes(y = daily_trip_rate), width = 0.15, alpha = 0.3, size = 2) +
+  geom_point(size = 4, position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), linewidth = 1) +
+  scale_color_manual(values = col_pal) +
+  labs(title = "A) Foraging Trip Rates", y = "Daily Trips", x = "Tidal State", color = leg_title) +
+  my_theme
+
+p2 <- ggplot(em_time, aes(x = primary_tide_state, y = response, 
+                          color = breeding_stage, group = breeding_stage)) +
+  geom_jitter(data = indiv_tide_summary, aes(y = mean_mudflat_time_mins), width = 0.15, alpha = 0.3, size = 2) +
+  geom_point(size = 4, position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), linewidth = 1) +
+  scale_color_manual(values = col_pal) +
+  labs(title = "B) Foraging Time", y = "Time (min)", x = "Tidal State", color = leg_title) +
+  my_theme
+
+p3 <- ggplot(em_range, aes(x = primary_tide_state, y = response, 
+                           color = breeding_stage, group = breeding_stage)) +
+  geom_jitter(data = indiv_tide_summary, aes(y = mean_max_range_km), width = 0.15, alpha = 0.3, size = 2) +
+  geom_point(size = 4, position = position_dodge(0.3)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, position = position_dodge(0.3)) +
+  geom_line(position = position_dodge(0.3), linewidth = 1) +
+  scale_color_manual(values = col_pal) +
+  labs(title = "C) Maximal Foraging Distance", y = "Range (km)", x = "Tidal State", color = leg_title) +
+  my_theme
+
+# ==============================================================================
+# 4. COMBINE
+# ==============================================================================
+final_plot <- (p1 / p2 / p3) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom") # This moves the collected legend to the bottom!
+
+print(final_plot)
+# Save a file with a much taller aspect ratio (height=14 instead of 12)
+my_path <- file.path("G:", "My Drive", "שנה ב", "birds", "Final Project")
+ggsave(file.path(my_path, "Gull_GLMM_Results.png"), plot = final_plot, width = 8, height = 14, dpi = 300)
+```
+
